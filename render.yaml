@@ -1,0 +1,18 @@
+# render.yaml (optional Blueprint)
+services:
+  - type: cron
+    name: orats-nightly-ingest
+    env: python
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python job_orats_eod.py
+    schedule: "30 02 * * MON-FRI"  # 7:30pm PT during DST
+    envVars:
+      - key: ORATS_TOKEN
+        sync: false  # prompt for secret in dashboard
+      - key: DATABASE_URL
+        sync: false  # prompt for secret
+      - key: TICKER
+        value: SPX
+      - key: DTE_MAX
+        value: "400"
