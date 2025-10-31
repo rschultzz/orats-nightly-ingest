@@ -4,6 +4,10 @@ from math import exp
 from db import get_conn  # NOTE: we bypass executemany_upsert to remove any ambiguity
 
 VERSION = "eod-shift-hard-upsert-2025-10-31b"
+log.info("[START %s] file=%s", VERSION, __file__)
+
+
+VERSION = "eod-shift-hard-upsert-2025-10-31b"
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(message)s")
