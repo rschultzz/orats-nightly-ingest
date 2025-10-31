@@ -3,6 +3,23 @@ import pytz, requests
 from math import exp
 from db import get_conn  # NOTE: we bypass executemany_upsert to remove any ambiguity
 
+import datetime as dt
+
+def _next_business_day(d: dt.date) -> dt.date:
+    nd = d + dt.timedelta(days=1)
+    if nd.weekday() == 5:  # Sat -> Mon
+        nd += dt.timedelta(days=2)
+    elif nd.weekday() == 6:  # Sun -> Mon
+        nd += dt.timedelta(days=1)
+    return nd
+
+def _parse_iso_date(s):
+    try:
+        return dt.date.fromisoformat(str(s)[:10])
+    except Exception:
+        return None
+
+
 VERSION = "eod-shift-hard-upsert-2025-10-31b"
 log.info("[START %s] file=%s", VERSION, __file__)
 
