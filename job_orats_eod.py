@@ -20,11 +20,12 @@ STRIKE_FIELDS = ",".join([
     "callOpenInterest","putOpenInterest","gamma"
 ])
 
-# Config
+# Config / Env
 TICKER = os.environ.get("TICKER", "SPX").strip()
 CARRY_TICKER = os.environ.get("CARRY_TICKER", "SPY").strip()  # proxy if SPX yield missing
 DTE_MAX = int(os.environ.get("DTE_MAX", "400"))
 CONTRACT_MULTIPLIER = float(os.environ.get("CONTRACT_MULTIPLIER", "100"))
+MAX_LOOKBACK_DAYS = int(os.environ.get("MAX_LOOKBACK_DAYS", "10"))
 
 # Timezones
 TZ_NY = pytz.timezone("America/New_York")
@@ -40,8 +41,7 @@ def _get(session: requests.Session, url: str, token: str, params: dict) -> reque
     return r
 
 def _is_bday(d: dt.date) -> bool:
-    # Mon-Fri only (no holiday calendar here)
-    return d.weekday() < 5
+    return d.weekday() < 5  # Mon-Fri
 
 def _next_bday(d: dt.date) -> dt.date:
     nd = d
@@ -56,7 +56,7 @@ def _prev_bday(d: dt.date) -> dt.date:
     return pd
 
 def _fetch_monies_map(session, token, ticker, trade_date):
-    """Return {expirDate: (riskFreeRate, yieldRate)} from Monies Implied for a given API trade_date."""
+    """Return {expirDate: (riskFreeRate, yieldRate)}."""
     res = {}
     for url in (MONIM_HIST_URL, MONIM_LIVE_URL):
         r = _get(session, url, token, {
@@ -97,9 +97,7 @@ def has_data_for_date(session, token, ticker, trade_date):
     return r.status_code == 200 and len(r.json().get("data", [])) > 0
 
 def find_prev_bday_with_data_from(session, token, ticker, start_date, max_lookback_days=10):
-    """
-    Start from (start_date - 1) and walk backward to find the most recent business day with data.
-    """
+    """Start from (start_date - 1) and walk backward to find the most recent business day with data."""
     day = start_date - dt.timedelta(days=1)
     for _ in range(max_lookback_days):
         if _is_bday(day) and has_data_for_date(session, token, ticker, day):
@@ -132,7 +130,9 @@ def parse_iso_date(s):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--date", help="Store date YYYY-MM-DD (overrides local LA 'today')")
+    # NEW: separate controls
+    ap.add_argument("--store-date", help="Force stored trade_date (YYYY-MM-DD). Defaults to LA today (Mon–Fri).")
+    ap.add_argument("--api-date", help="Force source API tradeDate (YYYY-MM-DD). Defaults to prev bday with data before store-date.")
     ap.add_argument("--token", help="ORATS API token (overrides ORATS_TOKEN env var)")
     args = ap.parse_args()
 
@@ -141,40 +141,40 @@ def main():
         log.error("Provide token via --token or ORATS_TOKEN.")
         sys.exit(2)
 
-    # 1) Decide the STORED trade date based on Los Angeles "today"
-    if args.date:
-        store_trade_date = dt.date.fromisoformat(args.date)
+    # 1) Decide STORED trade date (LA today by default, bump weekends to Monday)
+    if args.store_date:
+        store_trade_date = dt.date.fromisoformat(args.store_date)
     else:
         la_today = dt.datetime.now(TZ_LA).date()
-        store_trade_date = _next_bday(la_today) if not _is_bday(la_today) else la_today
+        store_trade_date = la_today if _is_bday(la_today) else _next_bday(la_today)
 
     with requests.Session() as session:
-        # 2) Find the API trade date = previous business day with data BEFORE the store date
-        api_trade_date = find_prev_bday_with_data_from(session, token, TICKER, store_trade_date)
-        if not api_trade_date:
-            log.error("Could not find a previous business day with data before %s", store_trade_date.isoformat())
-            sys.exit(3)
+        # 2) Decide API trade date (explicit or prev bday with data before the store date)
+        if args.api_date:
+            api_trade_date = dt.date.fromisoformat(args.api_date)
+        else:
+            api_trade_date = find_prev_bday_with_data_from(session, token, TICKER, store_trade_date, MAX_LOOKBACK_DAYS)
+            if not api_trade_date:
+                log.error("Could not find a previous business day with data before %s", store_trade_date.isoformat())
+                sys.exit(3)
 
-        log.info("Source(API) trade_date=%s  →  Stored trade_date=%s  [LA_today=%s, NY_now=%s]",
+        log.info("Source(API) trade_date=%s  →  Stored trade_date=%s  [LA_now=%s | NY_now=%s]",
                  api_trade_date.isoformat(),
                  store_trade_date.isoformat(),
                  dt.datetime.now(TZ_LA).strftime("%Y-%m-%d %H:%M:%S %Z"),
                  dt.datetime.now(TZ_NY).strftime("%Y-%m-%d %H:%M:%S %Z"))
 
-        # Carry per-expiration via Monies Implied (sourced off api_trade_date)
+        # 3) Monies / carry from API date
         m_spx = _fetch_monies_map(session, token, "SPX", api_trade_date)
-        m_spy = _fetch_monies_map(session, token, "SPY", api_trade_date)  # proxy if SPX missing yield
+        m_spy = _fetch_monies_map(session, token, "SPY", api_trade_date)
         have_spx_yield = sum(1 for _, (_, y) in m_spx.items() if y not in (None, 0, 0.0))
         have_spy_yield = sum(1 for _, (_, y) in m_spy.items() if y not in (None, 0, 0.0))
         log.info("Monies maps %s → SPX expir=%d (yields=%d), SPY expir=%d (yields=%d)",
                  api_trade_date, len(m_spx), have_spx_yield, len(m_spy), have_spy_yield)
 
-        # Fallback rf30 if an expiry lacks riskFreeRate
-        rf30 = _fetch_rf30(session, token, "SPX", api_trade_date)
-        if rf30 is None:
-            rf30 = _fetch_rf30(session, token, "SPY", api_trade_date)
+        rf30 = _fetch_rf30(session, token, "SPX", api_trade_date) or _fetch_rf30(session, token, "SPY", api_trade_date)
 
-        # Strikes (sourced off api_trade_date)
+        # 4) Strikes from API date
         data = fetch_eod_strikes(session, token, TICKER, api_trade_date)
         if DTE_MAX is not None:
             data = [d for d in data if d.get("dte") is None or int(d["dte"]) <= DTE_MAX]
@@ -182,11 +182,10 @@ def main():
             log.warning("No strike records for %s %s", TICKER, api_trade_date)
             return
 
-        # Build rows targeting the forward storage date. Recalculate DTE off the stored trade date.
+        # 5) Build rows with STORED date, recompute DTE from stored date
         rows = []
         for d in data:
             expd = d.get("expirDate")  # 'YYYY-MM-DD'
-            # prefer SPX monies; use SPY monies if SPX yield missing; else rf30 & 0.0 as last resort
             sr, dy = (None, None)
             if expd and expd in m_spx:
                 sr, dy = m_spx[expd]
@@ -195,16 +194,17 @@ def main():
                 if sr is None: sr = sr2
                 if dy2 not in (None, 0, 0.0): dy = dy2
             if sr is None: sr = rf30
-            if dy is None: dy = 0.0  # ensure discounted_level gets computed
+            if dy is None: dy = 0.0
 
             S      = d.get("stockPrice")
             gamma  = d.get("gamma")
             coi    = d.get("callOpenInterest")
             poi    = d.get("putOpenInterest")
+
             gex_call = compute_gex(S, gamma, coi)
             gex_put  = compute_gex(S, gamma, poi)
 
-            # Recompute DTE relative to the STORED trade date
+            # Recompute DTE using the STORED date (what you'll analyze by)
             eff_dte = d.get("dte")
             exp_date_obj = parse_iso_date(expd) if isinstance(expd, str) else None
             if exp_date_obj is not None:
@@ -214,8 +214,8 @@ def main():
 
             rows.append({
                 "ticker": d.get("ticker"),
-                "trade_date": store_trade_date.isoformat(),   # <<-- STORED date = LA "today" (Mon-Fri)
-                "expir_date": expd,
+                "trade_date": store_trade_date,   # Python date -> SQL DATE
+                "expir_date": expd,               # OK as ISO string if column is DATE it will cast; else keep as text
                 "dte": eff_dte,
                 "strike": d.get("strike"),
                 "stock_price": S,
@@ -229,16 +229,28 @@ def main():
                 "discounted_level": disc_lvl
             })
 
+        # 6) DB write (pre-delete today's rows to avoid PK collisions with insert-only upserter)
         with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    DELETE FROM orats_oi_gamma
+                    WHERE ticker = %s AND trade_date = %s
+                """, (TICKER, store_trade_date))
+                log.info("Deleted existing rows for (%s, %s) = %s",
+                         TICKER, store_trade_date.isoformat(), cur.rowcount)
+
+            # insert/upsert
             executemany_upsert(conn, rows)
+
             with conn.cursor() as cur:
                 cur.execute("REFRESH MATERIALIZED VIEW orats_gex_by_exp;")
+
             conn.commit()
 
-        log.info(
-            "Upserted %s rows. source_trade_date=%s stored_trade_date=%s",
-            len(rows), api_trade_date.isoformat(), store_trade_date.isoformat()
-        )
+        # small peek to aid debugging
+        sample_keys = [(r["expir_date"], r["strike"]) for r in rows[:3]]
+        log.info("Upserted %s rows. source_trade_date=%s stored_trade_date=%s samples=%s",
+                 len(rows), api_trade_date.isoformat(), store_trade_date.isoformat(), sample_keys)
 
 if __name__ == "__main__":
     main()
