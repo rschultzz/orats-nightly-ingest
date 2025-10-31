@@ -25,7 +25,10 @@ TICKER = os.environ.get("TICKER", "SPX").strip()
 CARRY_TICKER = os.environ.get("CARRY_TICKER", "SPY").strip()  # proxy if SPX yield missing
 DTE_MAX = int(os.environ.get("DTE_MAX", "400"))
 CONTRACT_MULTIPLIER = float(os.environ.get("CONTRACT_MULTIPLIER", "100"))
-FORWARD_ONE_BUSINESS_DAY = os.environ.get("FORWARD_ONE_BUSINESS_DAY", "1").lower() in ("1","true","t","yes","y")
+
+# Timezones
+TZ_NY = pytz.timezone("America/New_York")
+TZ_LA = pytz.timezone("America/Los_Angeles")
 
 def _mask(url: str, token: str) -> str:
     return url.replace(token, "***") if token else url
@@ -36,8 +39,24 @@ def _get(session: requests.Session, url: str, token: str, params: dict) -> reque
     log.debug("GET %s -> %s", _mask(r.url, token), r.status_code)
     return r
 
+def _is_bday(d: dt.date) -> bool:
+    # Mon-Fri only (no holiday calendar here)
+    return d.weekday() < 5
+
+def _next_bday(d: dt.date) -> dt.date:
+    nd = d
+    while not _is_bday(nd):
+        nd += dt.timedelta(days=1)
+    return nd
+
+def _prev_bday(d: dt.date) -> dt.date:
+    pd = d
+    while not _is_bday(pd):
+        pd -= dt.timedelta(days=1)
+    return pd
+
 def _fetch_monies_map(session, token, ticker, trade_date):
-    """Return {expirDate: (riskFreeRate, yieldRate)} from Monies Implied."""
+    """Return {expirDate: (riskFreeRate, yieldRate)} from Monies Implied for a given API trade_date."""
     res = {}
     for url in (MONIM_HIST_URL, MONIM_LIVE_URL):
         r = _get(session, url, token, {
@@ -77,24 +96,16 @@ def has_data_for_date(session, token, ticker, trade_date):
     r = _get(session, STRIKES_URL, token, {"ticker": ticker, "tradeDate": trade_date.isoformat(), "fields": "ticker"})
     return r.status_code == 200 and len(r.json().get("data", [])) > 0
 
-def previous_business_day_with_data(session, token, ticker, max_lookback_days=7):
-    et = pytz.timezone("America/New_York")
-    day = dt.datetime.now(et).date() - dt.timedelta(days=1)
+def find_prev_bday_with_data_from(session, token, ticker, start_date, max_lookback_days=10):
+    """
+    Start from (start_date - 1) and walk backward to find the most recent business day with data.
+    """
+    day = start_date - dt.timedelta(days=1)
     for _ in range(max_lookback_days):
-        if has_data_for_date(session, token, ticker, day):
+        if _is_bday(day) and has_data_for_date(session, token, ticker, day):
             return day
         day -= dt.timedelta(days=1)
     return None
-
-def next_business_day(d: dt.date) -> dt.date:
-    """Mon–Fri only (US holidays not applied)."""
-    nd = d + dt.timedelta(days=1)
-    # 0=Mon ... 5=Sat 6=Sun
-    if nd.weekday() == 5:  # Saturday -> Monday
-        nd += dt.timedelta(days=2)
-    elif nd.weekday() == 6:  # Sunday -> Monday
-        nd += dt.timedelta(days=1)
-    return nd
 
 def fetch_eod_strikes(session, token, ticker, trade_date):
     params = {"ticker": ticker, "tradeDate": trade_date.isoformat(), "fields": STRIKE_FIELDS}
@@ -121,7 +132,7 @@ def parse_iso_date(s):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--date", help="Trade date YYYY-MM-DD (defaults to most recent date with data)")
+    ap.add_argument("--date", help="Store date YYYY-MM-DD (overrides local LA 'today')")
     ap.add_argument("--token", help="ORATS API token (overrides ORATS_TOKEN env var)")
     args = ap.parse_args()
 
@@ -130,15 +141,25 @@ def main():
         log.error("Provide token via --token or ORATS_TOKEN.")
         sys.exit(2)
 
+    # 1) Decide the STORED trade date based on Los Angeles "today"
+    if args.date:
+        store_trade_date = dt.date.fromisoformat(args.date)
+    else:
+        la_today = dt.datetime.now(TZ_LA).date()
+        store_trade_date = _next_bday(la_today) if not _is_bday(la_today) else la_today
+
     with requests.Session() as session:
-        # Source API trade date (yesterday with data unless overridden)
-        api_trade_date = dt.date.fromisoformat(args.date) if args.date else previous_business_day_with_data(session, token, TICKER)
+        # 2) Find the API trade date = previous business day with data BEFORE the store date
+        api_trade_date = find_prev_bday_with_data_from(session, token, TICKER, store_trade_date)
         if not api_trade_date:
-            log.error("Could not find a recent trade date with data.")
+            log.error("Could not find a previous business day with data before %s", store_trade_date.isoformat())
             sys.exit(3)
 
-        # Storage trade date (forward to next business day unless disabled)
-        store_trade_date = next_business_day(api_trade_date) if FORWARD_ONE_BUSINESS_DAY else api_trade_date
+        log.info("Source(API) trade_date=%s  →  Stored trade_date=%s  [LA_today=%s, NY_now=%s]",
+                 api_trade_date.isoformat(),
+                 store_trade_date.isoformat(),
+                 dt.datetime.now(TZ_LA).strftime("%Y-%m-%d %H:%M:%S %Z"),
+                 dt.datetime.now(TZ_NY).strftime("%Y-%m-%d %H:%M:%S %Z"))
 
         # Carry per-expiration via Monies Implied (sourced off api_trade_date)
         m_spx = _fetch_monies_map(session, token, "SPX", api_trade_date)
@@ -164,7 +185,7 @@ def main():
         # Build rows targeting the forward storage date. Recalculate DTE off the stored trade date.
         rows = []
         for d in data:
-            expd = d.get("expirDate")  # expected 'YYYY-MM-DD'
+            expd = d.get("expirDate")  # 'YYYY-MM-DD'
             # prefer SPX monies; use SPY monies if SPX yield missing; else rf30 & 0.0 as last resort
             sr, dy = (None, None)
             if expd and expd in m_spx:
@@ -183,7 +204,7 @@ def main():
             gex_call = compute_gex(S, gamma, coi)
             gex_put  = compute_gex(S, gamma, poi)
 
-            # Recompute dte relative to the *stored* trade date to keep carry math consistent
+            # Recompute DTE relative to the STORED trade date
             eff_dte = d.get("dte")
             exp_date_obj = parse_iso_date(expd) if isinstance(expd, str) else None
             if exp_date_obj is not None:
@@ -193,7 +214,7 @@ def main():
 
             rows.append({
                 "ticker": d.get("ticker"),
-                "trade_date": store_trade_date.isoformat(),   # <<-- forward-stored date
+                "trade_date": store_trade_date.isoformat(),   # <<-- STORED date = LA "today" (Mon-Fri)
                 "expir_date": expd,
                 "dte": eff_dte,
                 "strike": d.get("strike"),
@@ -211,18 +232,13 @@ def main():
         with get_conn() as conn:
             executemany_upsert(conn, rows)
             with conn.cursor() as cur:
-                # If this MV depends on trade_date, refresh after the forward write
                 cur.execute("REFRESH MATERIALIZED VIEW orats_gex_by_exp;")
             conn.commit()
 
         log.info(
-            "Upserted %s rows. source_trade_date=%s stored_trade_date=%s forward=%s",
-            len(rows),
-            api_trade_date.isoformat(),
-            store_trade_date.isoformat(),
-            "ON" if FORWARD_ONE_BUSINESS_DAY else "OFF"
+            "Upserted %s rows. source_trade_date=%s stored_trade_date=%s",
+            len(rows), api_trade_date.isoformat(), store_trade_date.isoformat()
         )
 
 if __name__ == "__main__":
     main()
-
