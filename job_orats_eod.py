@@ -9,12 +9,17 @@ import requests
 from db import get_conn  # psycopg connection factory
 
 # ------------ Version & logging ------------------------------------------------
-VERSION = "eod-shift-hard-upsert-2025-10-31c"
+VERSION = "eod-shift-hard-upsert-2025-10-31d"
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("orats_job")
 log.info("[START %s] file=%s", VERSION, __file__)
+
+# Optional kill-switch to PROVE this exact file is running
+if os.environ.get("ABORT_ON_START") == "1":
+    log.error("ABORT_ON_START set — proving this file is executing. VERSION=%s", VERSION)
+    sys.exit(0)
 
 # ------------ Endpoints / constants -------------------------------------------
 STRIKES_URL    = "https://api.orats.io/datav2/hist/strikes"
@@ -37,11 +42,10 @@ TZ_NY = pytz.timezone("America/New_York")
 def _get(session: requests.Session, url: str, token: str, params: dict) -> requests.Response:
     q = dict(params); q["token"] = token
     r = session.get(url, params=q, timeout=120)
-    log.debug("GET %s -> %s", r.url, r.status_code)
+    logging.getLogger("orats_job").debug("GET %s -> %s", r.url, r.status_code)
     return r
 
 def _fetch_monies_map(session, token, ticker, trade_date):
-    """Return {expirDate: (riskFreeRate, yieldRate)} via monies implied."""
     res = {}
     for url in (MONIM_HIST_URL, MONIM_LIVE_URL):
         r = _get(session, url, token, {
@@ -49,28 +53,24 @@ def _fetch_monies_map(session, token, ticker, trade_date):
             "tradeDate": trade_date.isoformat(),
             "fields": "ticker,tradeDate,expirDate,riskFreeRate,yieldRate",
         })
-        if r.status_code >= 400:
+        if r.status_code >= 400: 
             continue
         for row in r.json().get("data", []):
             expd = row.get("expirDate")
-            if expd:
-                res[expd] = (row.get("riskFreeRate"), row.get("yieldRate"))
-        if res:
-            break
+            if expd: res[expd] = (row.get("riskFreeRate"), row.get("yieldRate"))
+        if res: break
     return res
 
 def _fetch_rf30(session, token, ticker, trade_date):
-    """Fallback single RF if needed."""
     for url in (SUMM_HIST_URL, SUMM_LIVE_URL):
         r = _get(session, url, token, {
             "ticker": ticker, "tradeDate": trade_date.isoformat(),
             "fields": "ticker,tradeDate,riskFree30",
         })
-        if r.status_code >= 400:
+        if r.status_code >= 400: 
             continue
         d = r.json().get("data", [])
-        if d:
-            return d[0].get("riskFree30")
+        if d: return d[0].get("riskFree30")
     return None
 
 def has_data_for_date(session, token, ticker, trade_date):
@@ -87,10 +87,8 @@ def previous_business_day_with_data(session, token, ticker, max_lookback_days=7)
 
 def next_business_day(d: dt.date) -> dt.date:
     nd = d + dt.timedelta(days=1)
-    if nd.weekday() == 5:      # Sat -> Mon
-        nd += dt.timedelta(days=2)
-    elif nd.weekday() == 6:    # Sun -> Mon
-        nd += dt.timedelta(days=1)
+    if nd.weekday() == 5: nd += dt.timedelta(days=2)  # Sat->Mon
+    elif nd.weekday() == 6: nd += dt.timedelta(days=1)  # Sun->Mon
     return nd
 
 def fetch_eod_strikes(session, token, ticker, trade_date):
@@ -128,26 +126,22 @@ def main():
         sys.exit(2)
 
     with requests.Session() as session:
-        # API source = yesterday with data (unless --date provided)
         api_trade_date = dt.date.fromisoformat(args.date) if args.date else previous_business_day_with_data(session, token, TICKER)
         if not api_trade_date:
             log.error("Could not find a recent trade date with data.")
             sys.exit(3)
 
-        # Stored date = next business day (or forced via env)
         forced = os.environ.get("FORCE_STORE_DATE")
         store_trade_date = dt.date.fromisoformat(forced) if forced else next_business_day(api_trade_date)
 
         log.info("API trade_date=%s  ->  STORED trade_date=%s  (forced=%s)",
                  api_trade_date.isoformat(), store_trade_date.isoformat(), bool(forced))
 
-        # Carry inputs (sourced from API date)
         m_spx = _fetch_monies_map(session, token, "SPX", api_trade_date)
         m_spy = _fetch_monies_map(session, token, "SPY", api_trade_date)
         rf30  = _fetch_rf30(session, token, "SPX", api_trade_date) or _fetch_rf30(session, token, "SPY", api_trade_date)
         log.info("Monies maps %s → SPX expir=%d, SPY expir=%d", api_trade_date, len(m_spx), len(m_spy))
 
-        # Pull strikes
         data = fetch_eod_strikes(session, token, TICKER, api_trade_date)
         if DTE_MAX is not None:
             data = [d for d in data if d.get("dte") is None or int(d["dte"]) <= DTE_MAX]
@@ -155,13 +149,11 @@ def main():
             log.warning("No strike records for %s %s", TICKER, api_trade_date)
             return
 
-        # Build rows for stored date (recompute dte vs stored date)
         rows = []
         for d in data:
             expd_s = d.get("expirDate")
             expd = parse_iso_date(expd_s)
 
-            # choose carry: prefer SPX, fall back to SPY, then rf30 / 0
             sr, dy = (None, None)
             if expd_s and expd_s in m_spx: sr, dy = m_spx[expd_s]
             if (dy in (None, 0, 0.0)) and expd_s and expd_s in m_spy:
@@ -171,20 +163,17 @@ def main():
             if sr is None: sr = rf30
             if dy is None: dy = 0.0
 
-            S      = d.get("stockPrice")
-            gamma  = d.get("gamma")
-            coi    = d.get("callOpenInterest")
-            poi    = d.get("putOpenInterest")
-            gex_call = compute_gex(S, gamma, coi)
-            gex_put  = compute_gex(S, gamma, poi)
+            S, gamma = d.get("stockPrice"), d.get("gamma")
+            coi, poi = d.get("callOpenInterest"), d.get("putOpenInterest")
+            gex_call, gex_put = compute_gex(S, gamma, coi), compute_gex(S, gamma, poi)
 
             eff_dte = (expd - store_trade_date).days if expd else d.get("dte")
             disc_lvl = compute_discounted_level(d.get("strike"), eff_dte, sr, dy)
 
             rows.append((
                 d.get("ticker"),
-                store_trade_date,   # <-- the date we store
-                expd,               # Python date -> SQL DATE
+                store_trade_date,   # <- store as NEXT business day
+                expd,
                 eff_dte,
                 d.get("strike"),
                 S,
@@ -219,21 +208,17 @@ def main():
         """
 
         with get_conn() as conn:
-            # Identify DB to avoid “wrong DB” confusion
             with conn.cursor() as cur:
                 cur.execute("select current_database(), current_user, current_setting('search_path'), inet_server_addr()::text")
-                ident = cur.fetchone()
-                log.info("DB IDENT: db=%s user=%s search_path=%s host=%s", *ident)
+                log.info("DB IDENT: db=%s user=%s search_path=%s host=%s", *cur.fetchone())
 
-            with conn.cursor() as cur:
-                # Pre-delete target day to avoid PK collisions on re-runs
-                cur.execute("DELETE FROM orats_oi_gamma WHERE ticker=%s AND trade_date=%s", (TICKER, store_trade_date))
-                log.info("Deleted existing rows for (%s, %s): %s", TICKER, store_trade_date.isoformat(), cur.rowcount)
+                cur.execute("DELETE FROM orats_oi_gamma WHERE ticker=%s AND trade_date=%s",
+                            (TICKER, store_trade_date))
+                log.info("Deleted existing rows for (%s, %s): %s",
+                         TICKER, store_trade_date.isoformat(), cur.rowcount)
 
-                # Explicit UPSERT (bypass any helper)
                 cur.executemany(upsert_sql, rows)
 
-                # Refresh MV (non-fatal if it fails)
                 try:
                     cur.execute("REFRESH MATERIALIZED VIEW orats_gex_by_exp;")
                 except Exception as e:
@@ -241,14 +226,14 @@ def main():
 
                 conn.commit()
 
-                # Post-commit verification
-                cur.execute("SELECT COUNT(*) FROM orats_oi_gamma WHERE ticker=%s AND trade_date=%s", (TICKER, store_trade_date))
+                cur.execute("SELECT COUNT(*) FROM orats_oi_gamma WHERE ticker=%s AND trade_date=%s",
+                            (TICKER, store_trade_date))
                 cnt = cur.fetchone()[0]
-                log.info("POST-COMMIT: rowcount for (%s, %s) = %s", TICKER, store_trade_date.isoformat(), cnt)
+                log.info("POST-COMMIT: rowcount for (%s, %s) = %s",
+                         TICKER, store_trade_date.isoformat(), cnt)
 
         log.info("[DONE %s] API=%s → STORED=%s | attempted_rows=%s",
                  VERSION, api_trade_date.isoformat(), store_trade_date.isoformat(), len(rows))
 
-# ------------------------------------------------------------------------------
 if __name__ == "__main__":
     main()
